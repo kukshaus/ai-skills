@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.DS_Store
+.cache/
+~/.cache/jira-skill/
