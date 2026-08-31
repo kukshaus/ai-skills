@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import itertools
 import json
 import os
 import re
@@ -208,7 +209,8 @@ class Jira:
 def md_to_adf(md: str) -> dict:
     """Convert a Markdown string to a minimal ADF document.
 
-    Supports: headings, paragraphs, bullet/ordered lists, code blocks (fenced),
+    Supports: headings, paragraphs, bullet/ordered lists, task lists (- [ ] / - [x]),
+    tables (GFM pipe syntax), blockquotes, horizontal rules, code blocks (fenced),
     bold (**), italic (*), inline code (`), and links [text](url).
     Anything else is rendered as plain text.
     """
@@ -240,6 +242,23 @@ def md_to_adf(md: str) -> dict:
             })
             i += 1
             continue
+        if _is_table_start(lines, i):
+            table, i = _collect_table(lines, i)
+            blocks.append(table)
+            continue
+        if re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", line):
+            blocks.append({"type": "rule"})
+            i += 1
+            continue
+        if line.lstrip().startswith(">"):
+            quote, i = _collect_quote(lines, i)
+            blocks.append(quote)
+            continue
+        if re.match(r"^\s*[-*]\s+\[[ xX]\]\s+", line):
+            items, i = _collect_tasklist(lines, i)
+            blocks.append({"type": "taskList", "attrs": {"localId": _local_id()},
+                           "content": items})
+            continue
         if re.match(r"^\s*[-*]\s+", line):
             items, i = _collect_list(lines, i, ordered=False)
             blocks.append({"type": "bulletList", "content": items})
@@ -266,13 +285,106 @@ def _is_block_start(line: str) -> bool:
         or re.match(r"^#{1,6}\s", line)
         or re.match(r"^\s*[-*]\s", line)
         or re.match(r"^\s*\d+\.\s", line)
+        or re.match(r"^\s*\|", line)
+        or re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", line)
+        or line.lstrip().startswith(">")
     )
+
+
+_LOCAL_ID = itertools.count(1)
+
+
+def _local_id() -> str:
+    return f"adf-{next(_LOCAL_ID)}"
+
+
+# ---- tables (GFM pipe syntax) ---- #
+
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$")
+
+
+def _is_table_row(line: str) -> bool:
+    return "|" in line and line.strip().startswith("|")
+
+
+def _is_table_start(lines: list[str], i: int) -> bool:
+    """A table needs a header row followed by a |---|---| separator row."""
+    return (
+        _is_table_row(lines[i])
+        and i + 1 < len(lines)
+        and "|" in lines[i + 1]
+        and bool(_TABLE_SEP.match(lines[i + 1]))
+    )
+
+
+def _split_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [c.strip() for c in stripped.split("|")]
+
+
+def _cell(kind: str, text: str) -> dict:
+    return {"type": kind, "attrs": {},
+            "content": [{"type": "paragraph", "content": _inline(text)}]}
+
+
+def _collect_table(lines, i):
+    headers = _split_row(lines[i])
+    width = len(headers)
+    rows = [{"type": "tableRow",
+             "content": [_cell("tableHeader", h) for h in headers]}]
+    i += 2  # skip header + separator
+    while i < len(lines) and _is_table_row(lines[i]):
+        cells = _split_row(lines[i])
+        # pad/trim so every row matches the header width — ADF requires it
+        cells = (cells + [""] * width)[:width]
+        rows.append({"type": "tableRow",
+                     "content": [_cell("tableCell", c) for c in cells]})
+        i += 1
+    table = {"type": "table",
+             "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+             "content": rows}
+    return table, i
+
+
+def _collect_quote(lines, i):
+    buf = []
+    while i < len(lines) and lines[i].lstrip().startswith(">"):
+        buf.append(re.sub(r"^\s*>\s?", "", lines[i]))
+        i += 1
+    paras = [{"type": "paragraph", "content": _inline(p)}
+             for p in "\n".join(buf).split("\n\n") if p.strip()]
+    return {"type": "blockquote",
+            "content": paras or [{"type": "paragraph", "content": []}]}, i
+
+
+def _collect_tasklist(lines, i):
+    items = []
+    pat = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$")
+    while i < len(lines):
+        m = pat.match(lines[i])
+        if not m:
+            break
+        items.append({
+            "type": "taskItem",
+            "attrs": {"localId": _local_id(),
+                      "state": "DONE" if m.group(1).lower() == "x" else "TODO"},
+            "content": _inline(m.group(2)),
+        })
+        i += 1
+    return items, i
 
 
 def _collect_list(lines, i, ordered):
     items = []
     pat = re.compile(r"^\s*\d+\.\s+(.*)$") if ordered else re.compile(r"^\s*[-*]\s+(.*)$")
+    task = re.compile(r"^\s*[-*]\s+\[[ xX]\]\s+")
     while i < len(lines):
+        if not ordered and task.match(lines[i]):
+            break  # a task list starts here — let md_to_adf handle it
         m = pat.match(lines[i])
         if not m:
             break
@@ -307,7 +419,10 @@ def _inline(text: str) -> list[dict]:
         pos = m.end()
     if pos < len(text):
         out.append({"type": "text", "text": text[pos:]})
-    return out or [{"type": "text", "text": text}]
+    if out:
+        return out
+    # ADF rejects text nodes with an empty string — return no content instead.
+    return [{"type": "text", "text": text}] if text else []
 
 
 # ---------- field-map cache ------------------------------------------------ #
